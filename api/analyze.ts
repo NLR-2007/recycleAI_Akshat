@@ -392,7 +392,7 @@ function mapError(error: unknown): Response {
 
 /* ----------------------------------------------------------------- handler */
 
-export default async function handler(request: Request): Promise<Response> {
+async function handleRequest(request: Request): Promise<Response> {
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: { Allow: 'POST, OPTIONS' } });
   }
@@ -519,5 +519,110 @@ export default async function handler(request: Request): Promise<Response> {
       error instanceof Error ? error.message : error,
     );
     return mapError(error);
+  }
+}
+
+/* ------------------------------------------------- runtime signature adapter */
+
+/**
+ * The logic above is written against the web platform (`Request` -> `Response`),
+ * which is how the tests and the Vite dev bridge drive it. Vercel's Node runtime
+ * may instead invoke the default export with the classic `(req, res)` pair. Under
+ * that convention a returned `Response` is simply discarded, so the function
+ * hangs until maxDuration, and any call to `request.headers.get()` throws because
+ * a Node request exposes headers as a plain object.
+ *
+ * So detect which convention we were called with and adapt, rather than assume.
+ */
+
+interface NodeRequestLike {
+  method?: string;
+  url?: string;
+  headers: Record<string, string | string[] | undefined>;
+  body?: unknown;
+  setEncoding?: (encoding: string) => void;
+  [Symbol.asyncIterator]?: () => AsyncIterator<Buffer | string>;
+}
+
+interface NodeResponseLike {
+  statusCode: number;
+  setHeader: (name: string, value: string) => void;
+  end: (chunk?: string | Uint8Array) => void;
+}
+
+function isNodeResponse(value: unknown): value is NodeResponseLike {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    typeof (value as NodeResponseLike).setHeader === 'function' &&
+    typeof (value as NodeResponseLike).end === 'function'
+  );
+}
+
+/** Recovers the raw request body, whether the runtime pre-parsed it or left a stream. */
+async function readNodeBody(req: NodeRequestLike): Promise<string | undefined> {
+  // Vercel's Node runtime parses JSON bodies onto req.body before we see them,
+  // which consumes the stream -- so prefer the parsed value when it is present.
+  const parsed = req.body;
+  if (typeof parsed === 'string') return parsed;
+  if (parsed instanceof Uint8Array) return Buffer.from(parsed).toString('utf8');
+  if (parsed && typeof parsed === 'object') return JSON.stringify(parsed);
+
+  if (typeof req[Symbol.asyncIterator] !== 'function') return undefined;
+  const chunks: Buffer[] = [];
+  for await (const chunk of req as AsyncIterable<Buffer | string>) {
+    chunks.push(typeof chunk === 'string' ? Buffer.from(chunk) : chunk);
+  }
+  if (chunks.length === 0) return undefined;
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function toWebRequest(req: NodeRequestLike, body: string | undefined): Request {
+  const headers = new Headers();
+  for (const [name, value] of Object.entries(req.headers)) {
+    if (value === undefined) continue;
+    for (const single of Array.isArray(value) ? value : [value]) headers.append(name, single);
+  }
+
+  const host = headers.get('host') || 'localhost';
+  const proto = headers.get('x-forwarded-proto') || 'https';
+  const method = (req.method || 'GET').toUpperCase();
+  const hasBody = method !== 'GET' && method !== 'HEAD' && body !== undefined;
+
+  // The size guard reads content-length, so keep it consistent with the body we
+  // actually recovered rather than trusting a header for a re-serialised value.
+  if (hasBody) headers.set('content-length', String(Buffer.byteLength(body)));
+
+  return new Request(new URL(req.url || '/', `${proto}://${host}`), {
+    method,
+    headers,
+    body: hasBody ? body : undefined,
+  });
+}
+
+async function sendWebResponse(response: Response, res: NodeResponseLike): Promise<void> {
+  res.statusCode = response.status;
+  response.headers.forEach((value, name) => res.setHeader(name, value));
+  const payload = Buffer.from(await response.arrayBuffer());
+  res.end(payload);
+}
+
+export default async function handler(
+  request: Request | NodeRequestLike,
+  response?: unknown,
+): Promise<Response | void> {
+  if (!isNodeResponse(response)) {
+    return handleRequest(request as Request);
+  }
+
+  const req = request as NodeRequestLike;
+  try {
+    const body = await readNodeBody(req);
+    const result = await handleRequest(toWebRequest(req, body));
+    await sendWebResponse(result, response);
+  } catch (error) {
+    // Never leave the socket open: an unanswered request hangs until maxDuration.
+    console.error('[analyze] adapter failure:', error instanceof Error ? error.message : error);
+    await sendWebResponse(mapError(error), response);
   }
 }
