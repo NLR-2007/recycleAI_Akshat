@@ -73,8 +73,9 @@ export function ReuseIdeasSection({ ideas, selectedIdeaId, onSelect }: ReuseIdea
                     <Hammer className="h-3.5 w-3.5" aria-hidden="true" />
                     <dt className="sr-only">Materials</dt>
                     <dd>
-                      {idea.materialsNeeded.length} item
-                      {idea.materialsNeeded.length === 1 ? '' : 's'}
+                      {idea.materialsNeeded.length === 0
+                        ? 'No extras'
+                        : `${idea.materialsNeeded.length} item${idea.materialsNeeded.length === 1 ? '' : 's'}`}
                     </dd>
                   </div>
                   <div className="flex items-center gap-1.5">
@@ -177,17 +178,23 @@ export function ReuseIdeaModal({
 
           <section>
             <h3 className="text-base">What you need</h3>
-            <ul className="mt-3 grid gap-2 sm:grid-cols-2">
-              {idea.materialsNeeded.map((material) => (
-                <li
-                  key={material}
-                  className="flex items-start gap-2.5 rounded-xl bg-cream px-3 py-2.5 text-sm text-ink/90"
-                >
-                  <Hammer className="mt-0.5 h-4 w-4 shrink-0 text-eco-600" aria-hidden="true" />
-                  <span>{material}</span>
-                </li>
-              ))}
-            </ul>
+            {idea.materialsNeeded.length === 0 ? (
+              <p className="mt-3 rounded-xl bg-cream px-3 py-2.5 text-sm text-muted">
+                Nothing beyond the item itself and basic household tools.
+              </p>
+            ) : (
+              <ul className="mt-3 grid gap-2 sm:grid-cols-2">
+                {idea.materialsNeeded.map((material) => (
+                  <li
+                    key={material}
+                    className="flex items-start gap-2.5 rounded-xl bg-cream px-3 py-2.5 text-sm text-ink/90"
+                  >
+                    <Hammer className="mt-0.5 h-4 w-4 shrink-0 text-eco-600" aria-hidden="true" />
+                    <span>{material}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
           </section>
 
           <section>

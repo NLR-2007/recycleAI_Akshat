@@ -1,8 +1,18 @@
+import { z } from 'zod';
 import { wasteAnalysisSchema, type AnalyzeResponse, type WasteAnalysis } from '../src/types/analysis';
-import { SYSTEM_PROMPT, buildUserPrompt, REPAIR_PROMPT } from './_prompt';
+import {
+  SYSTEM_PROMPT,
+  VISION_SYSTEM_PROMPT,
+  buildRepairPrompt,
+  buildUserPrompt,
+  buildVisionUserPrompt,
+  type VisionFinding,
+} from './_prompt';
 import {
   chatCompletion,
+  ConfigError,
   ProviderError,
+  hasAnyKey,
   resolveProviders,
   type ChatMessage,
   type ProviderConfig,
@@ -16,6 +26,12 @@ const MAX_BODY_BYTES = 4_000_000; // Vercel request bodies cap at ~4.5 MB
 const MAX_IMAGE_BYTES = 3_000_000; // decoded image bytes
 const MAX_ITEM_NAME = 120;
 const ALLOWED_MIME = new Set(['image/jpeg', 'image/jpg', 'image/png', 'image/webp']);
+
+const VISION_TIMEOUT_MS = 25_000;
+const TEXT_TIMEOUT_MS = 35_000;
+/** Successful analyses land around 2,000-2,500 tokens; providers reserve this
+ *  whole figure against per-minute token quotas, so keep it tight. */
+const ANALYSIS_MAX_TOKENS = 3_200;
 
 /* ---------------------------------------------- best-effort rate limiting */
 
@@ -85,6 +101,15 @@ function extractJsonObject(raw: string): unknown {
   return JSON.parse(text.slice(start, end + 1));
 }
 
+function describeIssues(error: unknown): string[] {
+  if (error instanceof z.ZodError) {
+    return error.issues
+      .slice(0, 8)
+      .map((issue) => `${issue.path.join('.') || '(root)'}: ${issue.message}`);
+  }
+  return error instanceof Error ? [error.message] : [];
+}
+
 /** Nudges near-miss model output into schema range instead of failing the whole request. */
 function coerce(value: unknown): unknown {
   if (!value || typeof value !== 'object') return value;
@@ -149,15 +174,220 @@ function parseDataUrl(dataUrl: string): { mime: string; bytes: number } | null {
   return { mime, bytes: Math.floor((clean.length * 3) / 4) - padding };
 }
 
-/** Logs why a reply was rejected, without ever logging the photo or the full reply. */
-function logShapeFailure(provider: ProviderConfig, error: unknown) {
-  const detail =
-    typeof error === 'object' && error && 'issues' in error
-      ? JSON.stringify((error as { issues: unknown }).issues).slice(0, 500)
-      : error instanceof Error
-        ? error.message
-        : 'unknown';
-  console.warn(`[analyze] ${provider.id}/${provider.model} returned unusable JSON: ${detail}`);
+function logProviderFailure(provider: ProviderConfig, stage: string, error: unknown) {
+  const message = error instanceof Error ? error.message : String(error);
+  console.warn(`[analyze] ${stage}: ${provider.id}/${provider.model} call failed: ${message.slice(0, 300)}`);
+}
+
+const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** One short retry for transient upstream failures (429, 5xx, timeouts). */
+async function callWithRetry(
+  provider: ProviderConfig,
+  messages: ChatMessage[],
+  options: Parameters<typeof chatCompletion>[2],
+  stage: string,
+): Promise<string> {
+  try {
+    return await chatCompletion(provider, messages, options);
+  } catch (error) {
+    if (error instanceof ProviderError && error.retryable) {
+      logProviderFailure(provider, `${stage} (retrying once)`, error);
+      await sleep(900);
+      return chatCompletion(provider, messages, options);
+    }
+    throw error;
+  }
+}
+
+function logShapeFailure(provider: ProviderConfig, stage: string, error: unknown) {
+  const detail = describeIssues(error).join('; ').slice(0, 400) || 'unknown';
+  console.warn(
+    `[analyze] ${stage}: ${provider.id}/${provider.model} returned unusable JSON: ${detail}`,
+  );
+}
+
+/* ------------------------------------------------------------ stage 1: see */
+
+const visionFindingSchema = z.object({
+  isPhysicalObject: z.boolean().default(true),
+  objectName: z.string().trim().min(1).max(200),
+  likelyMaterials: z.array(z.string().trim().min(1).max(200)).max(6).default([]),
+  visibleCondition: z.string().trim().max(400).default(''),
+  otherObjects: z.array(z.string().trim().min(1).max(200)).max(6).default([]),
+  notes: z.array(z.string().trim().min(1).max(300)).max(6).default([]),
+});
+
+interface VisionOutcome {
+  finding: VisionFinding;
+  provider: ProviderConfig;
+}
+
+/**
+ * Identifies the object in the photograph. Asks only "what is this?", which
+ * returns in a few seconds; the heavy writing happens in stage 2 on a fast
+ * text model.
+ */
+async function identifyFromImage(
+  imageDataUrl: string,
+  hint: string,
+): Promise<VisionOutcome> {
+  const providers = resolveProviders('vision');
+  if (providers.length === 0) {
+    throw new ConfigError(
+      'Photo analysis is not configured on this server. Set NVIDIA_NIM_API_KEY, or a GROQ_VISION_MODEL if your Groq account has a vision model. You can still analyse items by typing the name.',
+    );
+  }
+
+  const messages: ChatMessage[] = [
+    { role: 'system', content: VISION_SYSTEM_PROMPT },
+    {
+      role: 'user',
+      content: [
+        { type: 'text', text: buildVisionUserPrompt(hint || undefined) },
+        { type: 'image_url', image_url: { url: imageDataUrl } },
+      ],
+    },
+  ];
+
+  let lastError: Error = new ProviderError('image analysis failed', 502, true);
+
+  for (const provider of providers) {
+    try {
+      const raw = await callWithRetry(
+        provider,
+        messages,
+        { timeoutMs: VISION_TIMEOUT_MS, maxTokens: 700, temperature: 0.2 },
+        'vision',
+      );
+      const finding = visionFindingSchema.parse(extractJsonObject(raw));
+      return { finding, provider };
+    } catch (error) {
+      lastError = error as Error;
+      if (error instanceof ProviderError) logProviderFailure(provider, 'vision', error);
+      else logShapeFailure(provider, 'vision', error);
+    }
+  }
+
+  throw lastError;
+}
+
+/* ---------------------------------------------------------- stage 2: think */
+
+interface AnalysisOutcome {
+  analysis: WasteAnalysis;
+  provider: ProviderConfig;
+  attempts: number;
+}
+
+async function writeAnalysis(
+  itemName: string,
+  finding: VisionFinding | null,
+): Promise<AnalysisOutcome> {
+  const providers = resolveProviders('text');
+  if (providers.length === 0) {
+    throw new ConfigError(
+      'AI analysis is not configured on this server. Set GROQ_API_KEY and/or NVIDIA_NIM_API_KEY.',
+    );
+  }
+
+  const baseMessages: ChatMessage[] = [
+    { role: 'system', content: SYSTEM_PROMPT },
+    { role: 'user', content: buildUserPrompt(itemName || undefined, finding) },
+  ];
+
+  let attempts = 0;
+  let lastError: Error = new ProviderError('text analysis failed', 502, true);
+
+  for (const provider of providers) {
+    let messages = baseMessages;
+
+    // One attempt, then one corrective round-trip naming the exact problems.
+    for (let round = 0; round < 2; round += 1) {
+      attempts += 1;
+      let raw: string;
+      try {
+        raw = await callWithRetry(
+          provider,
+          messages,
+          { timeoutMs: TEXT_TIMEOUT_MS, maxTokens: ANALYSIS_MAX_TOKENS },
+          'analysis',
+        );
+      } catch (error) {
+        lastError = error as Error;
+        logProviderFailure(provider, 'analysis', error);
+        break; // provider unreachable or refused -- move to the next one
+      }
+
+      try {
+        const analysis = wasteAnalysisSchema.parse(coerce(extractJsonObject(raw)));
+        return { analysis: enforceSafety(analysis), provider, attempts };
+      } catch (error) {
+        lastError = error as Error;
+        logShapeFailure(provider, 'analysis', error);
+        // Deliberately omit the previous (bad) reply: resending it doubles the
+        // token count and trips Groq's tokens-per-minute limit on free tiers.
+        messages = [
+          ...baseMessages,
+          { role: 'user', content: buildRepairPrompt(describeIssues(error)) },
+        ];
+      }
+    }
+  }
+
+  throw lastError;
+}
+
+/* --------------------------------------------------------- error mapping */
+
+function mapError(error: unknown): Response {
+  // A missing/incomplete server configuration -- our own message is safe to show.
+  if (error instanceof ConfigError) {
+    return fail('not_configured', error.message, 503, false);
+  }
+
+  if (error instanceof ProviderError) {
+    if (error.status === 429) {
+      return fail(
+        'rate_limited',
+        'The AI provider is rate limiting requests right now. Please wait a moment and try again.',
+        429,
+        true,
+      );
+    }
+    if (error.status === 504) {
+      return fail('timeout', 'The AI provider took too long to respond. Please try again.', 504, true);
+    }
+    if (error.status === 401 || error.status === 403) {
+      return fail(
+        'not_configured',
+        'The server could not authenticate with the AI provider. Check the API keys.',
+        502,
+        false,
+      );
+    }
+    if (error.status === 503) {
+      return fail(
+        'upstream_error',
+        'The AI provider is temporarily unavailable. Please try again in a moment.',
+        503,
+        true,
+      );
+    }
+    return fail(
+      'upstream_error',
+      'The AI provider could not complete this analysis. Please try again.',
+      502,
+      true,
+    );
+  }
+
+  return fail(
+    'invalid_model_output',
+    'The AI returned a response we could not safely interpret. Please try again, ideally with a clearer photo or a more specific item name.',
+    502,
+    true,
+  );
 }
 
 /* ----------------------------------------------------------------- handler */
@@ -234,8 +464,7 @@ export default async function handler(request: Request): Promise<Response> {
     }
   }
 
-  const providers = resolveProviders();
-  if (providers.length === 0) {
+  if (!hasAnyKey()) {
     return fail(
       'not_configured',
       'AI analysis is not configured on the server. Set GROQ_API_KEY and/or NVIDIA_NIM_API_KEY.',
@@ -245,96 +474,50 @@ export default async function handler(request: Request): Promise<Response> {
   }
 
   const inputMode = imageDataUrl ? (itemName ? 'text+image' : 'image') : 'text';
-  const userContent = imageDataUrl
-    ? [
-        { type: 'text' as const, text: buildUserPrompt(itemName || undefined, true) },
-        { type: 'image_url' as const, image_url: { url: imageDataUrl } },
-      ]
-    : buildUserPrompt(itemName, false);
-
-  const baseMessages: ChatMessage[] = [
-    { role: 'system', content: SYSTEM_PROMPT },
-    { role: 'user', content: userContent },
-  ];
-
   const startedAt = Date.now();
-  let attempts = 0;
-  let lastError: Error | null = null;
 
-  for (const provider of providers) {
-    // Second pass drops response_format for models that reject it.
-    for (const jsonMode of [true, false]) {
-      let messages = baseMessages;
-      let providerUnusable = false;
+  try {
+    let finding: VisionFinding | null = null;
+    let visionProvider: ProviderConfig | null = null;
 
-      for (let round = 0; round < 2 && !providerUnusable; round += 1) {
-        attempts += 1;
-        let raw: string;
-        try {
-          raw = await chatCompletion(provider, messages, { jsonMode, timeoutMs: 45_000 });
-        } catch (error) {
-          lastError = error as Error;
-          providerUnusable = true;
-          break;
-        }
+    if (imageDataUrl) {
+      const outcome = await identifyFromImage(imageDataUrl, itemName);
+      finding = outcome.finding;
+      visionProvider = outcome.provider;
 
-        try {
-          const parsed = wasteAnalysisSchema.parse(coerce(extractJsonObject(raw)));
-          return json(
-            {
-              ok: true,
-              analysis: enforceSafety(parsed),
-              meta: {
-                provider: provider.id,
-                model: provider.model,
-                inputMode,
-                elapsedMs: Date.now() - startedAt,
-                attempts,
-              },
-            },
-            200,
-          );
-        } catch (error) {
-          lastError = error as Error;
-          logShapeFailure(provider, error);
-          messages = [
-            ...baseMessages,
-            { role: 'assistant', content: raw.slice(0, 6000) },
-            { role: 'user', content: REPAIR_PROMPT },
-          ];
-        }
+      if (!finding.isPhysicalObject) {
+        return fail(
+          'bad_request',
+          'We could not find a clear object in that photo. Please try a closer, better-lit picture of a single item, or type the item name instead.',
+          422,
+          false,
+        );
       }
-
-      // If the provider answered but the shape was wrong, retrying without JSON
-      // mode is unlikely to help -- move to the next provider instead.
-      if (!providerUnusable) break;
-      if (lastError instanceof ProviderError && lastError.status !== 400) break;
     }
+
+    const { analysis, provider, attempts } = await writeAnalysis(itemName, finding);
+
+    return json(
+      {
+        ok: true,
+        analysis,
+        meta: {
+          provider: provider.id,
+          model: provider.model,
+          visionProvider: visionProvider?.id,
+          visionModel: visionProvider?.model,
+          inputMode,
+          elapsedMs: Date.now() - startedAt,
+          attempts,
+        },
+      },
+      200,
+    );
+  } catch (error) {
+    console.error(
+      `[analyze] failed after ${Date.now() - startedAt}ms (${inputMode}):`,
+      error instanceof Error ? error.message : error,
+    );
+    return mapError(error);
   }
-
-  const elapsed = Date.now() - startedAt;
-  console.error(
-    `[analyze] all providers failed after ${attempts} attempt(s) in ${elapsed}ms:`,
-    lastError instanceof Error ? lastError.message : lastError,
-  );
-
-  if (lastError instanceof ProviderError) {
-    if (lastError.status === 429) {
-      return fail('rate_limited', 'The AI provider is rate limiting requests right now. Please try again shortly.', 429, true);
-    }
-    if (lastError.status === 504) {
-      return fail('timeout', 'The AI provider took too long to respond. Please try again.', 504, true);
-    }
-    if (lastError.status === 401 || lastError.status === 403) {
-      return fail('not_configured', 'The server could not authenticate with the AI provider. Check the API keys.', 502, false);
-    }
-    return fail('upstream_error', 'The AI provider could not complete this analysis. Please try again.', 502, true);
-  }
-
-  return fail(
-    'invalid_model_output',
-    'The AI returned a response we could not safely interpret. Please try again, ideally with a clearer photo or a more specific item name.',
-    502,
-    true,
-  );
 }

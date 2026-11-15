@@ -46,7 +46,18 @@ const GOOD = {
   uncertaintyNotice: 'The exact plastic type cannot be confirmed from a photo alone.',
 };
 
+const VISION = {
+  isPhysicalObject: true,
+  objectName: 'plastic water bottle',
+  likelyMaterials: ['likely clear PET-type plastic'],
+  visibleCondition: 'intact and empty',
+  otherObjects: [],
+  notes: ['resin code not legible'],
+};
+
 let mode = 'good';
+let visionMode = 'good';
+let lastVisionHadImage = null;
 const server = http.createServer((req, res) => {
   let body = '';
   req.on('data', (c) => (body += c));
@@ -56,6 +67,26 @@ const server = http.createServer((req, res) => {
       res.end(typeof payload === 'string' ? payload : JSON.stringify(payload));
     };
     const reply = (content) => send(200, { choices: [{ message: { content } }] });
+
+    // Stage 1: vision identification.
+    let isVision = false;
+    try {
+      const parsed = JSON.parse(body);
+      const system = parsed.messages?.[0]?.content ?? '';
+      isVision = typeof system === 'string' && system.includes('You identify everyday objects');
+      if (isVision) {
+        const user = parsed.messages?.[1]?.content;
+        lastVisionHadImage = Array.isArray(user) && user.some((p) => p.type === 'image_url');
+      }
+    } catch { /* fall through */ }
+
+    if (isVision) {
+      if (visionMode === 'not-an-object') {
+        return reply(JSON.stringify({ ...VISION, isPhysicalObject: false }));
+      }
+      if (visionMode === '500') return send(500, { error: 'vision down' });
+      return reply(JSON.stringify(VISION));
+    }
 
     if (mode === 'good') return reply(JSON.stringify(GOOD));
     if (mode === 'fenced') return reply('Sure! Here you go:\n```json\n' + JSON.stringify(GOOD) + '\n```');
@@ -71,17 +102,22 @@ const server = http.createServer((req, res) => {
         }),
       );
     }
+    if (mode === 'echo-prompt') {
+      // Proves the stage-2 prompt actually contains the stage-1 finding.
+      const parsed = JSON.parse(body);
+      const user = parsed.messages?.[1]?.content ?? '';
+      const text = typeof user === 'string' ? user : JSON.stringify(user);
+      const match = text.match(/Object seen: (.+)/);
+      return reply(JSON.stringify({ ...GOOD, itemName: match ? `SAW: ${match[1].trim()}` : 'NO FINDING' }));
+    }
     if (mode === 'garbage') return reply('I am afraid I cannot help with that request.');
     if (mode === 'short') return reply(JSON.stringify({ ...GOOD, advantages: ['only one'] }));
+    if (mode === '503') {
+      return send(503, { error: { message: 'content safety screening is temporarily unavailable' } });
+    }
     if (mode === '401') return send(401, { error: 'invalid api key' });
     if (mode === '429') return send(429, { error: 'rate limit' });
     if (mode === '500') return send(500, { error: 'boom' });
-    if (mode === 'image-echo') {
-      const parsed = JSON.parse(body);
-      const parts = parsed.messages[1].content;
-      const hasImage = Array.isArray(parts) && parts.some((p) => p.type === 'image_url');
-      return reply(JSON.stringify({ ...GOOD, itemName: hasImage ? 'IMAGE RECEIVED' : 'NO IMAGE' }));
-    }
     return send(500, { error: 'unknown mode' });
   });
 });
@@ -91,7 +127,10 @@ const port = server.address().port;
 
 process.env.GROQ_API_KEY = 'test-key';
 process.env.GROQ_BASE_URL = `http://127.0.0.1:${port}/v1`;
-process.env.GROQ_MODEL = 'mock-vision-model';
+process.env.GROQ_MODEL = 'mock-text-model';
+// The mock stands in for both stages, so give it a vision model too. In real
+// deployments Groq has no vision model and photos route to NVIDIA NIM.
+process.env.GROQ_VISION_MODEL = 'mock-vision-model';
 process.env.AI_PROVIDER_ORDER = 'groq';
 delete process.env.NVIDIA_NIM_API_KEY;
 
@@ -207,20 +246,56 @@ await check('fenced / chatty JSON is still parsed', async () => {
   expect(body.ok === true, 'expected ok:true');
 });
 
-await check('image payload reaches the provider as an image part', async () => {
-  mode = 'image-echo';
+await check('image reaches the vision stage as a real image part', async () => {
+  mode = 'good';
+  visionMode = 'good';
+  lastVisionHadImage = null;
   const res = await handler(post({ imageDataUrl: tinyPng }));
   expect(res.status === 200, `expected 200, got ${res.status}`);
   const body = await res.json();
-  expect(body.analysis.itemName === 'IMAGE RECEIVED', `provider saw: ${body.analysis.itemName}`);
+  expect(lastVisionHadImage === true, 'the vision stage did not receive an image_url part');
   expect(body.meta.inputMode === 'image', `inputMode was ${body.meta.inputMode}`);
+  expect(body.meta.visionModel, 'the response did not report which vision model was used');
+});
+
+await check('the vision finding is passed into the analysis stage', async () => {
+  mode = 'echo-prompt';
+  visionMode = 'good';
+  const res = await handler(post({ imageDataUrl: tinyPng }));
+  expect(res.status === 200, `expected 200, got ${res.status}`);
+  const body = await res.json();
+  expect(
+    body.analysis.itemName === 'SAW: plastic water bottle',
+    `the analysis prompt did not carry the vision finding (got "${body.analysis.itemName}")`,
+  );
 });
 
 await check('text + image is reported as text+image', async () => {
-  mode = 'image-echo';
+  mode = 'good';
   const res = await handler(post({ itemName: 'Cardboard box', imageDataUrl: tinyPng }));
   const body = await res.json();
   expect(body.meta.inputMode === 'text+image', `inputMode was ${body.meta.inputMode}`);
+});
+
+await check('a photo with no clear object is refused, not guessed at', async () => {
+  mode = 'good';
+  visionMode = 'not-an-object';
+  const res = await handler(post({ imageDataUrl: tinyPng }));
+  expect(res.status === 422, `expected 422, got ${res.status}`);
+  const body = await res.json();
+  expect(body.ok === false, 'expected ok:false');
+  expect(!('analysis' in body), 'a refused photo still returned an analysis');
+  visionMode = 'good';
+});
+
+await check('a failing vision stage does not fall through to a text-only guess', async () => {
+  mode = 'good';
+  visionMode = '500';
+  const res = await handler(post({ itemName: 'Plastic bottle', imageDataUrl: tinyPng }));
+  expect(res.status >= 400, `expected an error, got ${res.status}`);
+  const body = await res.json();
+  expect(body.ok === false, 'expected ok:false');
+  visionMode = 'good';
 });
 
 console.log('\n--- safety backstop ---');
@@ -259,6 +334,18 @@ await check('provider 429 maps to a retryable rate_limited error', async () => {
   expect(res.status === 429, `expected 429, got ${res.status}`);
   const body = await res.json();
   expect(body.error.code === 'rate_limited' && body.error.retryable === true, JSON.stringify(body.error));
+});
+
+await check('upstream 503 is an upstream error, not a config error, and leaks nothing', async () => {
+  mode = '503';
+  const res = await handler(post({ itemName: 'Glass jar' }));
+  const body = await res.json();
+  expect(body.error.code === 'upstream_error', `got ${body.error.code} (503 must not look like misconfiguration)`);
+  expect(body.error.retryable === true, 'an upstream 503 should be retryable');
+  expect(
+    !/content safety screening/i.test(JSON.stringify(body)),
+    "the provider's own error text leaked to the client",
+  );
 });
 
 await check('provider 500 maps to a retryable upstream_error', async () => {

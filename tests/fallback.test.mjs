@@ -26,7 +26,7 @@ process.env.GROQ_API_KEY = 'groq-key';
 process.env.GROQ_BASE_URL = `http://127.0.0.1:${broken.address().port}/v1`;
 process.env.NVIDIA_NIM_API_KEY = 'nvidia-key';
 process.env.NVIDIA_NIM_BASE_URL = `http://127.0.0.1:${working.address().port}/v1`;
-process.env.NVIDIA_NIM_MODEL = 'meta/llama-4-maverick-17b-128e-instruct';
+process.env.NVIDIA_NIM_MODEL = 'minimaxai/minimax-m3.1-flash';
 process.env.AI_PROVIDER_ORDER = 'groq,nvidia';
 
 const res = await handler(new Request('http://localhost/api/analyze', {

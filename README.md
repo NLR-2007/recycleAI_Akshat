@@ -89,16 +89,30 @@ Recharts, Lucide icons, Zod.
 
 **Backend** — a single Vercel Function in TypeScript: `POST /api/analyze`.
 
-**AI** — two OpenAI-compatible providers behind one server-side adapter:
+**AI** — two OpenAI-compatible providers behind one server-side adapter, and **two stages**:
 
-| Role | Provider | Default model | Env var |
+| Stage | Job | Provider / model | Measured |
 | --- | --- | --- | --- |
-| Primary | [Groq](https://console.groq.com) | `meta-llama/llama-4-scout-17b-16e-instruct` | `GROQ_API_KEY` |
-| Fallback | [NVIDIA NIM](https://build.nvidia.com) | `meta/llama-4-maverick-17b-128e-instruct` | `NVIDIA_NIM_API_KEY` |
+| 1. See | Identify the object in a photo | [NVIDIA NIM](https://build.nvidia.com) `minimaxai/minimax-m3.1-flash` | ~4–7 s |
+| 2. Think | Write the full analysis as JSON | [Groq](https://console.groq.com) `openai/gpt-oss-120b` | ~4–5 s |
+| 2. Think (fallback) | Same, if Groq fails or is rate limited | NVIDIA NIM `nvidia/nemotron-3.5-bolt-e4b` | ~9–11 s |
 
-Both models are multimodal, so photo and text analysis use the same code path. If Groq fails, times
-out or is rate limited, the request automatically retries on NVIDIA NIM. Either key alone is
-enough to run the app; set both for resilience. Order is configurable with `AI_PROVIDER_ORDER`.
+Why two stages: asking a vision model for the whole schema took **50–60 s** in testing, which does
+not fit a serverless time budget. Asking it only *"what is this?"* returns in a few seconds, and a
+fast text model then does the reasoning. The photograph is still genuinely analysed by a vision
+model — its finding, including every stated limit on confidence, is carried into stage 2 and
+surfaced in the identification notes.
+
+Groq's catalogue (for this account) is text-only and rejects image content parts outright, so
+`GROQ_VISION_MODEL` is left empty and photos route to NVIDIA. Either key alone runs the app — with
+only a Groq key, text analysis works and photo analysis returns a clear "not configured" message
+rather than guessing. Order is configurable with `AI_PROVIDER_ORDER`.
+
+> **Model availability differs per account.** Both catalogues change: the Llama-4 models this project
+> was first written against were absent from Groq and end-of-life on NVIDIA by the time it was wired
+> up. If a model 404s or returns "end of life", list what your key can actually reach with
+> `curl -H "Authorization: Bearer $KEY" https://api.groq.com/openai/v1/models` (or
+> `https://integrate.api.nvidia.com/v1/models`) and set the env vars accordingly.
 
 **Storage** — browser `localStorage` only. No accounts, no database, no server-side user data.
 
@@ -116,14 +130,23 @@ Vercel Function  api/analyze.ts            ← API keys live ONLY here
   ├─ method / content-type / body-size checks
   ├─ per-IP fixed-window rate limit
   ├─ MIME + decoded-size validation of the data URL
-  ├─ builds the system prompt (api/_prompt.ts)
-  ├─ calls provider 1 → provider 2 (api/_providers.ts)
-  ├─ extracts JSON (handles code fences and chatty replies)
-  ├─ validates against the Zod schema (src/types/analysis.ts)
-  ├─ one corrective round-trip if the shape is wrong
+  │
+  ├─ STAGE 1 (only when a photo was sent) ───────────────────────────
+  │    vision model: "what is this object, what is it made of,
+  │    what limits your confidence?"  → small JSON, validated
+  │    no clear object in frame → 422, and nothing is invented
+  │
+  ├─ STAGE 2 ────────────────────────────────────────────────────────
+  │    text model: full analysis, with the stage-1 finding as evidence
+  │    extracts JSON (handles code fences and chatty replies)
+  │    validates against the Zod schema (src/types/analysis.ts)
+  │    one corrective round-trip naming the exact schema violations
+  │    one retry per provider on 429 / 5xx / timeout, then next provider
+  │
   └─ hazardous-item safety backstop: strips reuse ideas, forces specialist disposal
   ▼
-{ ok: true, analysis, meta } or { ok: false, error: { code, message, retryable } }
+{ ok: true, analysis, meta: { provider, model, visionProvider, visionModel, ... } }
+  or { ok: false, error: { code, message, retryable } }
   ▼
 Browser saves scan metadata + analysis to localStorage (no photographs)
   → Results page, Eco Actions history, Dashboard charts
@@ -173,15 +196,22 @@ vercel dev
 Copy [`.env.example`](.env.example) to `.env.local` and fill in at least one API key:
 
 ```env
+# Groq: fast text analysis
 GROQ_API_KEY=your_groq_api_key
-GROQ_MODEL=meta-llama/llama-4-scout-17b-16e-instruct
+GROQ_MODEL=openai/gpt-oss-120b
+GROQ_VISION_MODEL=          # empty: Groq has no vision model on this account
 
+# NVIDIA NIM: photo identification + text fallback
 NVIDIA_NIM_API_KEY=your_nvidia_nim_api_key
-NVIDIA_NIM_MODEL=meta/llama-4-maverick-17b-128e-instruct
+NVIDIA_NIM_VISION_MODEL=minimaxai/minimax-m3.1-flash
+NVIDIA_NIM_MODEL=nvidia/nemotron-3.5-bolt-e4b
 NVIDIA_NIM_BASE_URL=https://integrate.api.nvidia.com/v1
 
 AI_PROVIDER_ORDER=groq,nvidia
 ```
+
+A provider with no key, or no model set for the stage in question, is skipped rather than called
+and failed — that is how photos bypass Groq automatically.
 
 All of these are **server-side** variables. None is prefixed with `VITE_`, so none is ever bundled
 into the browser. `.env.local` is git-ignored. Never commit a real key, and never paste one into a
@@ -224,22 +254,36 @@ handler against a mock provider:
 
 | Suite | Covers |
 | --- | --- |
-| `tests/api.test.mjs` (19 tests) | method and content-type rejection, empty/short input, unsupported MIME, malformed data URL, oversized payload, missing keys, successful text analysis, fenced/chatty JSON recovery, image part delivery, input-mode reporting, hazardous-item backstop, provider 401/429/500 mapping, non-JSON and schema-violating replies, per-IP throttling with `Retry-After` |
+| `tests/api.test.mjs` (23 tests) | method and content-type rejection, empty/short input, unsupported MIME, malformed data URL, oversized payload, missing keys, successful text analysis, fenced/chatty JSON recovery, **image delivery to the vision stage**, **the vision finding reaching the analysis prompt**, **a photo with no clear object being refused rather than guessed at**, **a failing vision stage not falling through to a text-only guess**, input-mode reporting, hazardous-item backstop, provider 401/429/500/503 mapping (an upstream 503 must not look like misconfiguration, and provider error text must never reach the client), non-JSON and schema-violating replies, per-IP throttling with `Retry-After` |
 | `tests/fallback.test.mjs` | a failing Groq request transparently falls back to NVIDIA NIM |
 | `tests/storage.test.mjs` (17 tests) | save/load/update/delete, persistence across a simulated reload, "planning never counts as completed", completion timestamps, note cap, record cap, dashboard aggregation (summary, donut, bars, 14-day series), no image data in storage, graceful handling of corrupted storage |
 
-Latest run: **37 passed, 0 failed**, alongside a clean `npm run typecheck`, `npm run lint`
+Latest run: **41 passed, 0 failed**, alongside a clean `npm run typecheck`, `npm run lint`
 (0 errors) and `npm run build`.
 
-Manual checks worth repeating against a real key before you demo:
+### Verified against the live providers
 
-1. Text input — `Plastic water bottle` → identification, pros/cons, impact, guidance, up to 3 ideas.
-2. Image upload — a photo of a cardboard box → preview, real AI result, useful suggestions.
-3. Eco actions — pick a project, mark it complete, confirm history and dashboard update.
-4. Persistence — refresh the page; records, results and stats remain.
-5. Safety — `Damaged lithium-ion battery` → warnings, specialist disposal, **no** DIY ideas.
-6. API failure — set a deliberately invalid key → safe error plus retry, no fabricated analysis.
-7. Deployment — the public URL on desktop and mobile, including direct navigation to each route.
+Run with real keys through the dev server:
+
+| Case | Result |
+| --- | --- |
+| Text: `Plastic water bottle` | identified, 4 advantages / 5 disadvantages, 3 reuse ideas, 4.1 s via Groq |
+| Photo: bottle image, no text hint | identified as a plastic water bottle, 3 ideas, 11.5 s (NVIDIA vision → Groq text). It also noted on its own that the image was *an illustration, not a photograph* |
+| Text: `Damaged lithium-ion battery` | `hazardous`, 3 hazard warnings, **0** reuse ideas, `specialized-disposal` |
+| Text: `Old pesticide bottle with leftover liquid` | `hazardous`, **0** reuse ideas, `specialized-disposal` |
+| Text: phone / umbrella / notebook / can | `donate` / `repair` / `keep-using` / `recycle`, 3 ideas each, 4–5 s |
+| NVIDIA only, text | 9.2 s via `nemotron-3.5-bolt-e4b` |
+| NVIDIA only, photo | 20.8 s (vision + text both on NVIDIA) — the slowest real path, inside the 60 s limit |
+| Invalid API key | HTTP 502 `not_configured`, no analysis in the body, key not echoed |
+| No keys configured | HTTP 503 with a clear setup message |
+| Groq key only + a photo | HTTP 503 explaining that photo analysis needs an NVIDIA key; text still works |
+
+Still worth doing by hand before a demo, in the browser:
+
+1. Eco actions — pick a project, mark it complete, confirm history and dashboard update.
+2. Persistence — refresh the page; records, results and stats remain.
+3. Mobile — camera capture, drag-and-drop, and the charts at phone width.
+4. Deployment — the public URL on desktop and mobile, including direct navigation to each route.
 
 ## Deploying to Vercel
 
@@ -269,11 +313,18 @@ the function is given 1024 MB and a 60 s limit.
   `429` with `Retry-After`. Serverless instances are ephemeral and not shared, so this is a speed
   bump, not a guarantee. For anything public and busy, put a shared store (Upstash Redis, Vercel
   KV) or Vercel's WAF/rate-limiting in front of it.
-- **Provider quotas** — both Groq and NVIDIA NIM apply their own free-tier rate and token limits.
-  Watch usage in the [Groq console](https://console.groq.com) and
-  [NVIDIA build dashboard](https://build.nvidia.com), and set the fallback order to suit whichever
-  has headroom.
-- **Timeouts** — each provider call is aborted after 45 s; the function's own limit is 60 s.
+- **Provider quotas** — these bite in practice. The Groq free tier used here allows **8,000 tokens
+  per minute**, and one analysis costs roughly 4,600, so sustained use is about one or two scans a
+  minute before Groq returns 429. The app handles this by design: it retries once, then falls back
+  to NVIDIA NIM (~9–11 s instead of ~4 s) and keeps working. For a live demo, either pace the scans
+  or set `AI_PROVIDER_ORDER=nvidia,groq`. Watch usage in the
+  [Groq console](https://console.groq.com) and [NVIDIA build dashboard](https://build.nvidia.com).
+- **Token budgeting** — providers reserve `max_tokens` against the per-minute quota, so the analysis
+  call asks for 3,200 (real replies land near 2,000–2,500), and the corrective round-trip names the
+  schema violations instead of resending the rejected reply. Both choices exist purely to stay
+  inside the free-tier token budget.
+- **Timeouts** — the vision call is aborted after 25 s and the analysis call after 35 s, with one
+  retry on 429/5xx/timeout; the function's own limit is 60 s.
 - **Logging** — the function logs provider, model and failure reasons only. Photographs, data URLs
   and API keys are never logged, and error responses never echo provider internals.
 
@@ -295,6 +346,10 @@ still works for one-off analyses. The UI honours `prefers-reduced-motion`.
 - No local recycling-centre lookup — the app never invents municipal rules or facilities.
 - English only for now.
 - Completed actions are self-reported and not verified.
+- Free-tier provider limits cap sustained use at roughly one or two scans a minute before the
+  slower fallback takes over (see Quotas above).
+- Photo analysis needs an NVIDIA NIM key, because Groq's models on this account cannot accept
+  images. With only a Groq key, typing the item name still works.
 
 ## AI and environmental accuracy disclaimer
 

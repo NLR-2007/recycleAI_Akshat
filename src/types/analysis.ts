@@ -32,7 +32,7 @@ export const reuseIdeaSchema = z.object({
   description: paragraph,
   difficulty: z.enum(DIFFICULTIES),
   estimatedTime: shortString,
-  materialsNeeded: z.array(shortString).min(1).max(12),
+  materialsNeeded: z.array(shortString).max(12).default([]),
   instructions: z.array(paragraph).min(2).max(12),
   safetyNotes: z.array(shortString).max(8).default([]),
   environmentalBenefit: paragraph,
@@ -74,8 +74,12 @@ export type ReuseIdea = z.infer<typeof reuseIdeaSchema>;
 export type WasteAnalysis = z.infer<typeof wasteAnalysisSchema>;
 
 export interface AnalyzeMeta {
+  /** Provider that produced the written analysis (stage 2). */
   provider: 'groq' | 'nvidia';
   model: string;
+  /** Provider that identified the photograph (stage 1), when an image was sent. */
+  visionProvider?: 'groq' | 'nvidia';
+  visionModel?: string;
   inputMode: 'text' | 'image' | 'text+image';
   elapsedMs: number;
   attempts: number;

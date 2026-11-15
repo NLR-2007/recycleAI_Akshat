@@ -22,12 +22,12 @@ const STEPS = [
   {
     step: 2 as const,
     title: 'Our own server calls the AI provider',
-    body: 'The request goes to /api/analyze, a serverless function on Vercel. It validates your input, then calls Groq (primary) or NVIDIA NIM (fallback). API keys stay on the server and never reach the browser.',
+    body: 'The request goes to /api/analyze, a serverless function on Vercel. It validates your input, then calls the AI providers. API keys stay on the server and never reach the browser.',
   },
   {
     step: 3 as const,
-    title: 'The reply is validated before you see it',
-    body: 'The model must return JSON matching a strict schema. The server checks it with Zod, applies a safety backstop for hazardous items, and rejects anything malformed instead of guessing.',
+    title: 'A photo is read first, then reasoned about',
+    body: 'When you send an image, a vision model identifies the object and its visible materials, and that finding is passed to a fast text model which writes the full analysis. Both stages must return JSON matching a strict schema: the server checks it with Zod, applies a safety backstop for hazardous items, and rejects anything malformed instead of guessing.',
   },
   {
     step: 4 as const,
@@ -39,7 +39,7 @@ const STEPS = [
 const STACK = [
   { icon: Sparkles, label: 'Frontend', value: 'React 18, TypeScript, Vite, Tailwind CSS, React Router, Framer Motion, Recharts' },
   { icon: Server, label: 'Backend', value: 'Vercel Functions (TypeScript), one POST /api/analyze endpoint' },
-  { icon: Brain, label: 'AI', value: 'Groq (primary) with NVIDIA NIM fallback, vision-capable Llama models, JSON output validated by Zod' },
+  { icon: Brain, label: 'AI', value: 'Two stages over OpenAI-compatible APIs: a vision model on NVIDIA NIM identifies photos, then Groq (with NVIDIA NIM as fallback) writes the analysis. Every reply is validated by Zod.' },
   { icon: Database, label: 'Storage', value: 'Browser localStorage only -- no accounts, no database, no server-side user data' },
 ];
 

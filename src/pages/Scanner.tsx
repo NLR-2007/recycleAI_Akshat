@@ -226,8 +226,9 @@ export function Scanner() {
           <Alert tone="info" title="Privacy">
             <p>
               Your photo and item name are sent to our own server, which forwards them to the
-              configured AI provider (Groq, with NVIDIA NIM as fallback) purely to produce this
-              analysis. We do not store your photographs, and API keys never reach the browser.
+              configured AI providers purely to produce this analysis. A photo is read by a vision
+              model, then a text model writes the result. We do not store your photographs, and API
+              keys never reach the browser.
             </p>
             <p className="mt-2 flex items-center gap-1.5 font-semibold">
               <Lock className="h-3.5 w-3.5" aria-hidden="true" />

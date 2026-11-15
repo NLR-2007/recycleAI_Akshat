@@ -228,33 +228,72 @@ function generic(name) {
   };
 }
 
+const visionFinding = {
+  isPhysicalObject: true,
+  objectName: 'plastic water bottle',
+  likelyMaterials: ['likely clear PET-type plastic', 'polypropylene cap'],
+  visibleCondition: 'intact and empty, label still attached',
+  otherObjects: [],
+  notes: ['resin code not legible in the photo'],
+};
+
+const notAnObject = {
+  isPhysicalObject: false,
+  objectName: 'unclear',
+  likelyMaterials: [],
+  visibleCondition: 'no discardable object is clearly visible',
+  otherObjects: [],
+  notes: ['the photo does not show a single clear object'],
+};
+
 const server = http.createServer((req, res) => {
   let raw = '';
   req.on('data', (chunk) => {
     raw += chunk;
   });
   req.on('end', () => {
-    let text = '';
+    let systemText = '';
+    let userText = '';
+    let hasImage = false;
     try {
       const parsed = JSON.parse(raw);
-      const content = parsed.messages && parsed.messages[1] && parsed.messages[1].content;
-      text = typeof content === 'string' ? content : JSON.stringify(content);
+      const system = parsed.messages && parsed.messages[0] && parsed.messages[0].content;
+      const user = parsed.messages && parsed.messages[1] && parsed.messages[1].content;
+      systemText = typeof system === 'string' ? system : JSON.stringify(system);
+      if (Array.isArray(user)) {
+        hasImage = user.some((part) => part && part.type === 'image_url');
+        userText = user.map((part) => (part && part.type === 'text' ? part.text : '')).join(' ');
+      } else {
+        userText = typeof user === 'string' ? user : JSON.stringify(user);
+      }
     } catch {
-      text = '';
+      systemText = '';
     }
 
-    const lower = text.toLowerCase();
+    const reply = (payload, note) => {
+      console.log('[mock] ' + note);
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] }));
+    };
+
+    // Stage 1: the vision identification prompt.
+    if (systemText.includes('You identify everyday objects in photographs')) {
+      if (/not-?an-?object|no object/i.test(userText)) {
+        return reply(notAnObject, 'vision -> not a physical object');
+      }
+      return reply(visionFinding, 'vision -> ' + visionFinding.objectName + (hasImage ? ' (image received)' : ' (NO IMAGE!)'));
+    }
+
+    // Stage 2: the full analysis prompt.
+    const lower = userText.toLowerCase();
     let payload = bottle;
     if (lower.includes('battery') || lower.includes('lithium')) {
       payload = battery;
     } else if (!lower.includes('bottle')) {
-      const match = text.match(/everyday object: "([^"]+)"/i);
+      const match = userText.match(/everyday object: "([^"]+)"/i);
       if (match) payload = generic(match[1]);
     }
-
-    console.log('[mock] -> ' + payload.itemName);
-    res.writeHead(200, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify({ choices: [{ message: { content: JSON.stringify(payload) } }] }));
+    return reply(payload, 'analysis -> ' + payload.itemName);
   });
 });
 
