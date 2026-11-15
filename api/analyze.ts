@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { wasteAnalysisSchema, type AnalyzeResponse, type WasteAnalysis } from '../src/types/analysis.js';
+import { wasteAnalysisSchema, type AnalyzeResponse, type WasteAnalysis } from './_schema.js';
 import {
   SYSTEM_PROMPT,
   VISION_SYSTEM_PROMPT,
