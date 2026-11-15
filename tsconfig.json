@@ -1,4 +1,24 @@
 {
+  // Solution file: `tsc -b` builds the referenced projects below and ignores
+  // the options here. Vercel, however, compiles api/*.ts against THIS file and
+  // never reads tsconfig.node.json, so the options it needs are repeated here.
+  //
+  // `strict` in particular is load-bearing. Without it TypeScript falls back to
+  // its defaults (strict off), zod's `.default()` infers its output as optional,
+  // api/analyze.ts fails to compile with TS2322, and Vercel emits no function at
+  // all -- so every request returns FUNCTION_INVOCATION_FAILED at runtime.
+  // Deliberately no "noEmit" here: that is for the local type-check projects,
+  // and setting it could suppress the function build.
+  "compilerOptions": {
+    "target": "ES2022",
+    "lib": ["ES2023"],
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "types": ["node"],
+    "strict": true,
+    "skipLibCheck": true,
+    "esModuleInterop": true
+  },
   "files": [],
   "references": [
     { "path": "./tsconfig.app.json" },

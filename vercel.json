@@ -5,7 +5,6 @@
   "outputDirectory": "dist",
   "functions": {
     "api/analyze.ts": {
-      "memory": 1024,
       "maxDuration": 60
     }
   },
