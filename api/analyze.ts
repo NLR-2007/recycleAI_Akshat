@@ -1,5 +1,5 @@
 import { z } from 'zod';
-import { wasteAnalysisSchema, type AnalyzeResponse, type WasteAnalysis } from '../src/types/analysis';
+import { wasteAnalysisSchema, type AnalyzeResponse, type WasteAnalysis } from '../src/types/analysis.js';
 import {
   SYSTEM_PROMPT,
   VISION_SYSTEM_PROMPT,
@@ -7,7 +7,7 @@ import {
   buildUserPrompt,
   buildVisionUserPrompt,
   type VisionFinding,
-} from './_prompt';
+} from './_prompt.js';
 import {
   chatCompletion,
   ConfigError,
@@ -16,7 +16,7 @@ import {
   resolveProviders,
   type ChatMessage,
   type ProviderConfig,
-} from './_providers';
+} from './_providers.js';
 
 export const config = { maxDuration: 60 };
 
