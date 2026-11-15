@@ -13,13 +13,32 @@ function devApiPlugin(mode: string): Plugin {
     name: 'recyclevision-dev-api',
     apply: 'serve',
     configureServer(server) {
-      // Make server-only secrets from .env / .env.local visible to the handler.
+      // Make server-only settings from .env / .env.local visible to the handler.
+      // The file wins over anything already in process.env: otherwise a dev
+      // server started before an edit keeps serving the old models, and the only
+      // symptom is a 502 from a provider that no longer offers them.
       const env = loadEnv(mode, process.cwd(), '');
       for (const [key, value] of Object.entries(env)) {
-        if (!key.startsWith('VITE_') && process.env[key] === undefined) {
-          process.env[key] = value;
-        }
+        if (!key.startsWith('VITE_')) process.env[key] = value;
       }
+
+      // Say out loud what will actually be called. Never print the keys.
+      const described = (['groq', 'nvidia'] as const).map((id) => {
+        const hasKey = Boolean(
+          id === 'groq'
+            ? process.env.GROQ_API_KEY
+            : process.env.NVIDIA_NIM_API_KEY || process.env.NVIDIA_API_KEY,
+        );
+        if (!hasKey) return `${id}: no key`;
+        const text = id === 'groq' ? process.env.GROQ_MODEL : process.env.NVIDIA_NIM_MODEL;
+        const vision =
+          id === 'groq' ? process.env.GROQ_VISION_MODEL : process.env.NVIDIA_NIM_VISION_MODEL;
+        return `${id}: text=${text || '(default)'} vision=${vision || 'none'}`;
+      });
+      server.config.logger.info(
+        `  [32m➜[39m  [1mAI[22m:      ${described.join('  |  ')}`,
+        { clear: false },
+      );
 
       server.middlewares.use('/api/analyze', async (req, res) => {
         try {
